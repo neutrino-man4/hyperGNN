@@ -46,7 +46,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
+PT_INDEX = 2 # Index of pT fraction in jetConstituentsList
 # ---------------------------------------------------------------------------
 # Index precomputation
 # ---------------------------------------------------------------------------
@@ -281,14 +281,22 @@ def process_file(
     J: int,
     chunk_size: Optional[int],
     indices: dict,
+    pt_min: float,
+    pt_max: float,
+    max_jets: Optional[int],
 ) -> np.ndarray:
     """
     Load one HDF5 file and return per-jet C_N^(beta) values.
 
-    Memory strategy: when chunk_size is set, pair_delta_R and
-    constituent_pt_weight are loaded J-sliced in batches of chunk_size jets.
-    The returned C values are one scalar per jet, so concatenating them is
-    memory-cheap relative to the full constituent arrays.
+    Jets are first filtered by the pT window [pt_min, pt_max) using the
+    jet_pt column from the 'jetFeatures' dataset (index 0). The max_jets
+    cap is applied after pT filtering. Data loading then operates only on
+    the selected row indices, avoiding loading rejected jets entirely.
+
+    When chunk_size is set, the selected index array is partitioned into
+    chunks of that size and the HDF5 datasets are accessed via integer
+    fancy indexing per chunk. h5py requires the index array to be sorted
+    and strictly increasing, which np.where guarantees.
 
     Parameters
     ----------
@@ -298,15 +306,41 @@ def process_file(
     J          : number of leading constituents per jet
     chunk_size : jet batch size for H5 reads; None means load all at once
     indices    : precomputed combination index dict
+    pt_min     : lower bound of jet pT selection window (GeV), inclusive
+    pt_max     : upper bound of jet pT selection window (GeV), exclusive
+    max_jets   : cap on number of jets after pT filter; None means no cap
 
     Returns
     -------
     np.ndarray of shape (N_valid,) with NaN-filtered C_N values
     """
+    # ---- Read metadata and pT column in a single file open ---------------
     with h5py.File(h5_path, "r") as f:
-        n_jets: int = int(f["pair_delta_R"].shape[0])
+        n_jets: int     = int(f["pair_delta_R"].shape[0])
         max_stored: int = int(f["pair_delta_R"].shape[1])
+        jet_pt: np.ndarray = f["jetFeatures"][:, 0]  # (N_jets,) float32
 
+    # ---- pT selection -----------------------------------------------------
+    valid_idx: np.ndarray = np.where(
+        (jet_pt >= pt_min) & (jet_pt < pt_max)
+    )[0]  # sorted ascending, guaranteed by np.where
+
+    if max_jets is not None:
+        valid_idx = valid_idx[:max_jets]
+
+    logger.info(
+        "pT cut [%.1f, %.1f) GeV: %d / %d jets selected.",
+        pt_min, pt_max, len(valid_idx), n_jets,
+    )
+
+    if len(valid_idx) == 0:
+        logger.warning(
+            "No jets pass pT cut [%.1f, %.1f) GeV in %s; returning empty array.",
+            pt_min, pt_max, h5_path,
+        )
+        return np.empty(0, dtype=np.float64)
+
+    # ---- Constituent count clamping ---------------------------------------
     if J > max_stored:
         logger.warning(
             "Requested J=%d exceeds stored constituent count %d; clamping to %d.",
@@ -315,41 +349,48 @@ def process_file(
         J = max_stored
 
     logger.info(
-        "Processing %s | n_jets=%d | J=%d | chunk_size=%s",
-        h5_path, n_jets, J, chunk_size,
+        "Processing %s | selected_jets=%d | J=%d | chunk_size=%s",
+        h5_path, len(valid_idx), J, chunk_size,
     )
 
+    # ---- Build index chunks -----------------------------------------------
+    # Both cases (chunked and non-chunked) use fancy index arrays so that
+    # only selected rows are loaded from disk. The non-chunked case is a
+    # single chunk containing all valid indices.
+    if chunk_size is not None:
+        idx_chunks: list[np.ndarray] = [
+            valid_idx[s : s + chunk_size]
+            for s in range(0, len(valid_idx), chunk_size)
+        ]
+    else:
+        idx_chunks = [valid_idx]
+
+    # ---- Load and compute -------------------------------------------------
     c_list: list[np.ndarray] = []
 
     with h5py.File(h5_path, "r") as f:
         dr_ds = f["pair_delta_R"]           # (N_jets, 100, 100)
-        z_ds  = f["constituent_pt_weight"]  # (N_jets, 100)
+        z_ds  = f["jetConstituentsList"][...,PT_INDEX]  # (N_jets, 100)
 
-        ranges: list[tuple[int, int]] = (
-            [(s, min(s + chunk_size, n_jets)) for s in range(0, n_jets, chunk_size)]
-            if chunk_size is not None
-            else [(0, n_jets)]
-        )
-
-        for start, end in ranges:
-            # Slice only the leading J constituents to reduce I/O and memory.
-            # Constituents are pT-sorted descending (JetClass convention),
-            # so [:J] selects the J hardest constituents.
-            dr_slice = dr_ds[start:end, :J, :J].astype(np.float64)  # (B, J, J)
-            z_slice  = z_ds [start:end, :J    ].astype(np.float64)  # (B, J)
+        for idx_chunk in idx_chunks:
+            # Fancy indexing on axis 0 loads only the selected rows.
+            # Slicing :J on axes 1 and 2 limits constituent count.
+            dr_slice = dr_ds[idx_chunk, :J, :J].astype(np.float64)  # (B, J, J)
+            z_slice  = z_ds [idx_chunk, :J    ].astype(np.float64)  # (B, J)
 
             c_batch = compute_c_ratio_batch(z_slice, dr_slice, beta, N, indices)
             c_list.append(c_batch)
-            logger.debug("Processed jets %d to %d.", start, end - 1)
+            logger.debug("Processed chunk of %d jets.", len(idx_chunk))
 
+    # ---- NaN filtering ----------------------------------------------------
     c_all: np.ndarray = np.concatenate(c_list)
 
     n_nan: int = int(np.isnan(c_all).sum())
     if n_nan > 0:
         logger.warning(
-            "%d / %d jets yielded NaN C_%d (ECF(%d)=0, likely fewer than 2 "
-            "real constituents within J=%d); excluded from histogram.",
-            n_nan, n_jets, N, N, J,
+            "%d / %d selected jets yielded NaN C_%d (ECF(%d)=0, likely fewer "
+            "than 2 real constituents within J=%d); excluded from histogram.",
+            n_nan, len(valid_idx), N, N, J,
         )
 
     valid: np.ndarray = c_all[~np.isnan(c_all)]
@@ -445,8 +486,24 @@ def parse_args() -> argparse.Namespace:
         metavar="FILE",
         help="Output filename for the saved figure.",
     )
-    return parser.parse_args()
 
+    parser.add_argument(
+    "--max-jets",
+    type=int,
+    default=None,
+    metavar="N",
+    help="Maximum number of jets to process per file after pT selection. "
+        "If None, all jets passing the pT cut are used.",
+    )
+    parser.add_argument(
+        "--pt-range",
+        nargs=2,
+        type=float,
+        default=[200.0, 300.0],
+        metavar=("PT_MIN", "PT_MAX"),
+        help="Process only jets with pt_min <= jet_pT < pt_max (GeV). Default: 200 300.",
+    )
+    return parser.parse_args()
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -455,7 +512,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Main entry point."""
     args = parse_args()
-
+    
     # ---- Input validation -------------------------------------------------
     if args.ecf_beta <= 0.0:
         raise ValueError(f"--ecf-beta must be positive; got {args.ecf_beta}.")
@@ -487,6 +544,9 @@ def main() -> None:
             J=J,
             chunk_size=args.chunking,
             indices=indices,
+        pt_min=args.pt_range[0],
+        pt_max=args.pt_range[1],
+        max_jets=args.max_jets,
         )
         all_c.append(c_vals)
 
