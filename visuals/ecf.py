@@ -47,6 +47,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 PT_INDEX = 2 # Index of pT fraction in jetConstituentsList
+PT_IDX = 0 # Index of jet pT in jetFeatures
+SDMASS_IDX = 5 # Index of soft-drop mass in jetFeatures
 # ---------------------------------------------------------------------------
 # Index precomputation
 # ---------------------------------------------------------------------------
@@ -284,6 +286,7 @@ def process_file(
     pt_min: float,
     pt_max: float,
     max_jets: Optional[int],
+    mass_window: bool = False,
 ) -> np.ndarray:
     """
     Load one HDF5 file and return per-jet C_N^(beta) values.
@@ -318,20 +321,30 @@ def process_file(
     with h5py.File(h5_path, "r") as f:
         n_jets: int     = int(f["pair_delta_R"].shape[0])
         max_stored: int = int(f["pair_delta_R"].shape[1])
-        jet_pt: np.ndarray = f["jetFeatures"][:, 0]  # (N_jets,) float32
-
+        jet_pt: np.ndarray = f["jetFeatures"][:, PT_IDX]  # (N_jets,) float32
+        jet_mass: np.ndarray = f["jetFeatures"][:, SDMASS_IDX]  # (N_jets,) float32
     # ---- pT selection -----------------------------------------------------
     valid_idx: np.ndarray = np.where(
         (jet_pt >= pt_min) & (jet_pt < pt_max)
     )[0]  # sorted ascending, guaranteed by np.where
 
+    if mass_window:
+        valid_idx: np.ndarray = np.where(
+        (jet_pt >= pt_min) & (jet_pt < pt_max) & (jet_mass > 140.0) & (jet_mass < 210.0)
+    )[0]
+    
     if max_jets is not None:
         valid_idx = valid_idx[:max_jets]
-
-    logger.info(
-        "pT cut [%.1f, %.1f) GeV: %d / %d jets selected.",
+    if mass_window: 
+        logger.info(
+        "pT cut [%.1f, %.1f) GeV with mass window [140, 210) GeV: %d / %d jets selected.",
         pt_min, pt_max, len(valid_idx), n_jets,
     )
+    else:
+        logger.info(
+            "pT cut [%.1f, %.1f) GeV: %d / %d jets selected.",
+            pt_min, pt_max, len(valid_idx), n_jets,
+        )
 
     if len(valid_idx) == 0:
         logger.warning(
@@ -482,7 +495,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=str,
-        default="ecf_ratio.pdf",
+        default="./plots",
         metavar="FILE",
         help="Output filename for the saved figure.",
     )
@@ -495,6 +508,15 @@ def parse_args() -> argparse.Namespace:
     help="Maximum number of jets to process per file after pT selection. "
         "If None, all jets passing the pT cut are used.",
     )
+    parser.add_argument(
+        "--mass-window",
+        action="store_true",
+        help=(
+            "If set, apply an additional mass window cut of 140 < m_SD < 210 GeV "
+            "after the pT cut. Uses the soft-drop mass column from 'jetFeatures' (index 5)."
+        ),
+    ) # TODO: Custom user-defined mass window with two float args instead of hardcoded values and store_true
+
     parser.add_argument(
         "--pt-range",
         nargs=2,
@@ -547,6 +569,7 @@ def main() -> None:
         pt_min=args.pt_range[0],
         pt_max=args.pt_range[1],
         max_jets=args.max_jets,
+        mass_window=args.mass_window,
         )
         all_c.append(c_vals)
 
@@ -602,9 +625,12 @@ def main() -> None:
     fig.tight_layout()
 
     out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    logger.info("Figure saved to %s", out)
+    out.mkdir(parents=True, exist_ok=True)
+    web_path = Path('/web/abal/public_html/plots/QFIT/data_checks/')
+    web_path.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out / 'ecf_ratios.pdf', bbox_inches="tight")
+    fig.savefig(web_path / 'ecf_ratios.pdf', bbox_inches="tight")
+    logger.info("Figure saved to %s and %s", out, web_path)
     plt.show()
 
 
